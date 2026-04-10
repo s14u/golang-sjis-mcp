@@ -10,9 +10,9 @@ Claude Code の組み込み Read/Edit/Write ツールでは文字化けが発生
 
 | ツール | 説明 |
 |--------|------|
-| `read_sjis` | Shift JIS ファイルを読み込み、UTF-8 として返す |
+| `read_sjis` | Shift JIS ファイルを読み込み、UTF-8 として返す（行範囲指定・検索対応） |
 | `write_sjis` | UTF-8 文字列を Shift JIS でファイルに書き込む |
-| `edit_sjis` | Shift JIS ファイル内の文字列を置換する（ファイルは SJIS のまま） |
+| `edit_sjis` | Shift JIS ファイル内の文字列を置換する（ファイルは SJIS のまま、Unicode NFC 正規化対応） |
 
 ## ビルド
 
@@ -85,6 +85,13 @@ Shift JIS プロジェクトの `CLAUDE.md` に以下を追記することで、
 - grep/find/diff 等のシェルコマンドは Bash ツールで直接実行して構わない
   - ただし grep で日本語を検索する場合は `LANG=ja_JP.SJIS grep ...` のように指定する
 ```
+
+## v1.2.0 での改善点
+
+- **`read_sjis`: 行範囲指定** — `line_start` / `line_end` パラメータで部分読み込みが可能に。大きなファイルでもトークン上限を超えずに読める
+- **`read_sjis`: 検索機能** — `search` / `context_lines` パラメータで grep 相当の検索が MCP 内で完結。Shift JIS ファイル内の日本語検索も環境依存なし
+- **`edit_sjis`: 日本語マッチング改善** — Unicode NFC 正規化により、日本語を含む `old_str` でのマッチ失敗を解消
+- **`edit_sjis`: 診断情報改善** — マッチ失敗時に `old_str` の先頭3行それぞれについて類似行を表示
 
 ## 注意事項
 
