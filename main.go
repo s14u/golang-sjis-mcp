@@ -93,7 +93,7 @@ type ContentBlock struct {
 var tools = []Tool{
 	{
 		Name:        "read_sjis",
-		Description: "Shift JIS エンコードのファイルを読み込み、UTF-8 文字列として返します。行番号付きで返すことも可能です。line_start/line_end で部分読み込みもできます。",
+		Description: "Shift JIS エンコードのファイルを読み込み、UTF-8 文字列として返します。行番号付きで返すことも可能です。line_start/line_end で部分読み込みもできます。行番号付き / 部分読み込み / 検索の各モードでは、出力末尾に edit_sjis の行範囲モード使用例ヒントを付与します。",
 		InputSchema: InputSchema{
 			Type: "object",
 			Properties: map[string]Property{
@@ -126,14 +126,21 @@ var tools = []Tool{
 		},
 	},
 	{
-		Name:        "write_sjis",
-		Description: "UTF-8 文字列を Shift JIS エンコードでファイルに書き込みます。",
+		Name: "write_sjis",
+		Description: `UTF-8 文字列を Shift JIS エンコードで【新規ファイル】として書き込みます。
+
+⚠️ このツールは新規ファイル作成専用です。
+- 指定パスに既にファイルが存在する場合はエラーになります（誤上書き防止）
+- 既存ファイルを編集したい場合は必ず edit_sjis を使用してください
+  - 一部置換: edit_sjis (old_str / new_str)
+  - 行範囲置換: edit_sjis (line_start / line_end / new_str)
+  - 全内容差し替え: read_sjis で総行数を確認 → edit_sjis で line_start=1, line_end=<総行数> 指定`,
 		InputSchema: InputSchema{
 			Type: "object",
 			Properties: map[string]Property{
 				"path": {
 					Type:        "string",
-					Description: "書き込み先ファイルのパス",
+					Description: "書き込み先ファイルのパス（既存ファイルがあるとエラー）",
 				},
 				"content": {
 					Type:        "string",
@@ -151,12 +158,16 @@ var tools = []Tool{
 - old_str に一致する箇所を new_str に置換します
 - normalize_newlines: true（デフォルト）で CRLF/LF の違いを無視してマッチします
 - replace_all: true で全出現箇所を置換します（デフォルトは false で1箇所のみ）
-- dry_run: true にするとファイルを変更せず、マッチ結果のみ返します
+- dry_run: true にするとファイルを変更せず、マッチ箇所と before/after の差分（diff 形式）を返します
 - マッチしない場合は診断情報（最も近い候補行）を返します
 
 【行番号置換モード】line_start / line_end / new_str を指定
 - 指定した行範囲を new_str の内容で置き換えます
-- read_sjis で行番号を確認してから使うと確実です`,
+- read_sjis で行番号を確認してから使うと確実です
+- dry_run: true で置換前/置換後の差分（diff 形式）を確認できます
+
+【共通】
+- 編集後の結果メッセージには維持された改行コード（CRLF / LF）が表示されます`,
 		InputSchema: InputSchema{
 			Type: "object",
 			Properties: map[string]Property{
@@ -284,6 +295,46 @@ func findNearestMatch(content, oldStr string) string {
 	return strings.Join(sections, "\n")
 }
 
+// ─── diff 表示: dry_run 用 ──────────────────────────────────────────────────
+
+// formatDiff は old/new の文字列を行単位の diff 形式で整形する。
+// シンプルな全置換表示（- old 全行, + new 全行）。
+// 巨大な置換でも視認できるよう、各サイドが maxLines を超えたら省略する。
+func formatDiff(oldStr, newStr string) string {
+	const maxLines = 30
+	normalizedOld := strings.ReplaceAll(oldStr, "\r\n", "\n")
+	normalizedNew := strings.ReplaceAll(newStr, "\r\n", "\n")
+	oldLines := strings.Split(normalizedOld, "\n")
+	newLines := strings.Split(normalizedNew, "\n")
+
+	formatSide := func(prefix string, lines []string) string {
+		sb := strings.Builder{}
+		shown := lines
+		truncated := false
+		if len(lines) > maxLines {
+			shown = lines[:maxLines]
+			truncated = true
+		}
+		for _, l := range shown {
+			fmt.Fprintf(&sb, "%s %s\n", prefix, l)
+		}
+		if truncated {
+			fmt.Fprintf(&sb, "%s ... (%d 行省略)\n", prefix, len(lines)-maxLines)
+		}
+		return sb.String()
+	}
+
+	return formatSide("-", oldLines) + formatSide("+", newLines)
+}
+
+// describeNewline は改行コードを人間可読な文字列で返す。
+func describeNewline(hasCRLF bool) string {
+	if hasCRLF {
+		return "CRLF"
+	}
+	return "LF"
+}
+
 // ─── 検索: grep 相当 ─────────────────────────────────────────────────────────
 
 func searchInContent(content, query string, contextLines int) string {
@@ -385,7 +436,14 @@ func editSJISByString(path, oldStr, newStr string, normalizeNL, replaceAll, dryR
 		for i, l := range matchLines {
 			lineNums[i] = fmt.Sprintf("%d", l)
 		}
-		return fmt.Sprintf("[dry-run] %d 箇所マッチしました（行: %s）。実際の変更は行いません。", count, strings.Join(lineNums, ", ")), nil
+		appliedNote := "（最初の1箇所のみ置換されます）"
+		if replaceAll {
+			appliedNote = "（全箇所が置換されます）"
+		}
+		return fmt.Sprintf(
+			"[dry-run] %d 箇所マッチしました（行: %s）%s。改行コード: %s。実際の変更は行いません。\n\n--- 差分（同じ置換が各マッチ箇所に適用されます） ---\n%s",
+			count, strings.Join(lineNums, ", "), appliedNote, describeNewline(hasCRLF), formatDiff(workOld, workNew),
+		), nil
 	}
 
 	// ── Step 2: 実際の置換 ──
@@ -417,10 +475,11 @@ func editSJISByString(path, oldStr, newStr string, normalizeNL, replaceAll, dryR
 		return "", err
 	}
 
+	nl := describeNewline(hasCRLF)
 	if replaceAll {
-		return fmt.Sprintf("編集完了（%s）: %d 箇所を置換しました。", path, count), nil
+		return fmt.Sprintf("編集完了（%s）: %d 箇所を置換しました。改行コード: %s で保存しました。", path, count, nl), nil
 	}
-	return fmt.Sprintf("編集完了（%s）", path), nil
+	return fmt.Sprintf("編集完了（%s）: 1 箇所を置換しました。改行コード: %s で保存しました。", path, nl), nil
 }
 
 func editSJISByLineRange(path string, lineStart, lineEnd int, newStr string, dryRun bool) (string, error) {
@@ -442,13 +501,17 @@ func editSJISByLineRange(path string, lineStart, lineEnd int, newStr string, dry
 		return "", fmt.Errorf("line_end=%d が無効です（line_start=%d, 総行数=%d）", lineEnd, lineStart, total)
 	}
 
-	if dryRun {
-		replaced := lines[lineStart-1 : lineEnd]
-		return fmt.Sprintf("[dry-run] 行 %d〜%d を置換予定:\n%s", lineStart, lineEnd, strings.Join(replaced, "\n")), nil
-	}
-
 	normalizedNewStr := strings.ReplaceAll(newStr, "\r\n", "\n")
 	newLines := strings.Split(normalizedNewStr, "\n")
+
+	if dryRun {
+		oldBlock := strings.Join(lines[lineStart-1:lineEnd], "\n")
+		newBlock := strings.Join(newLines, "\n")
+		return fmt.Sprintf(
+			"[dry-run] 行 %d〜%d（%d 行）を %d 行に置換予定。改行コード: %s。実際の変更は行いません。\n\n--- 差分 ---\n%s",
+			lineStart, lineEnd, lineEnd-lineStart+1, len(newLines), describeNewline(hasCRLF), formatDiff(oldBlock, newBlock),
+		), nil
+	}
 
 	result := make([]string, 0, len(lines)-int(lineEnd-lineStart)+len(newLines))
 	result = append(result, lines[:lineStart-1]...)
@@ -463,7 +526,10 @@ func editSJISByLineRange(path string, lineStart, lineEnd int, newStr string, dry
 	if err := writeSJIS(path, newContent); err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("編集完了（%s）: 行 %d〜%d を置換しました。", path, lineStart, lineEnd), nil
+	return fmt.Sprintf(
+		"編集完了（%s）: 行 %d〜%d（%d 行）を %d 行に置換しました。改行コード: %s で保存しました。",
+		path, lineStart, lineEnd, lineEnd-lineStart+1, len(newLines), describeNewline(hasCRLF),
+	), nil
 }
 
 // ─── ツール呼び出しハンドラ ───────────────────────────────────────────────────
@@ -538,6 +604,7 @@ func handleCallTool(params json.RawMessage) (interface{}, *RPCError) {
 			if result == "" {
 				return errResult(fmt.Sprintf("検索文字列 %q が見つかりませんでした（%s）", searchStr, path))
 			}
+			result += fmt.Sprintf("\nヒント: 上記マッチ行 ('>' 印) の行番号を控えて edit_sjis を {path: %q, line_start: <N>, line_end: <M>, new_str: \"...\"} で呼ぶと該当範囲を直接編集できます。\n", path)
 			return CallToolResult{
 				Content: []ContentBlock{{Type: "text", Text: result}},
 			}, nil
@@ -550,17 +617,20 @@ func handleCallTool(params json.RawMessage) (interface{}, *RPCError) {
 		// 行範囲の決定
 		lineStart := 1
 		lineEnd := totalLines
+		hasRange := false
 		if ls, ok := getInt("line_start"); ok {
 			if ls < 1 || ls > totalLines {
 				return errResult(fmt.Sprintf("line_start=%d がファイルの行数(%d行)の範囲外です", ls, totalLines))
 			}
 			lineStart = ls
+			hasRange = true
 		}
 		if le, ok := getInt("line_end"); ok {
 			if le < lineStart || le > totalLines {
 				return errResult(fmt.Sprintf("line_end=%d が無効です（line_start=%d, 総行数=%d）", le, lineStart, totalLines))
 			}
 			lineEnd = le
+			hasRange = true
 		}
 
 		// 出力組み立て
@@ -577,6 +647,10 @@ func handleCallTool(params json.RawMessage) (interface{}, *RPCError) {
 				sb.WriteByte('\n')
 			}
 		}
+		// edit_sjis への橋渡しヒント（行番号付き / 部分読み込み時のみ）
+		if lineNumbers || hasRange {
+			fmt.Fprintf(&sb, "\nヒント: この範囲を直接編集するには edit_sjis を {path: %q, line_start: %d, line_end: %d, new_str: \"...\"} で呼んでください（行番号は1始まり、line_end も含む）。\n", path, lineStart, lineEnd)
+		}
 		return CallToolResult{
 			Content: []ContentBlock{{Type: "text", Text: sb.String()}},
 		}, nil
@@ -590,11 +664,25 @@ func handleCallTool(params json.RawMessage) (interface{}, *RPCError) {
 		if !ok {
 			return errResult("content が指定されていません")
 		}
+		// 新規作成専用: 既存ファイルがあれば拒否（誤上書き防止）
+		if info, err := os.Stat(path); err == nil {
+			return errResult(fmt.Sprintf(
+				"既存ファイル %q（%d バイト）が存在するため write_sjis は使用できません。\n"+
+					"write_sjis は新規ファイル作成専用です。既存ファイルを編集する場合は edit_sjis を使ってください:\n"+
+					"  - 一部置換: edit_sjis {path: %q, old_str: \"...\", new_str: \"...\"}\n"+
+					"  - 行範囲置換: edit_sjis {path: %q, line_start: <N>, line_end: <M>, new_str: \"...\"}\n"+
+					"  - ファイル全体を差し替え: read_sjis で総行数を確認後、edit_sjis {path: %q, line_start: 1, line_end: <総行数>, new_str: \"<新内容>\"}",
+				path, info.Size(), path, path, path))
+		} else if !os.IsNotExist(err) {
+			return errResult(fmt.Sprintf("ファイルの状態確認に失敗しました: %v", err))
+		}
 		if err := writeSJIS(path, content); err != nil {
 			return errResult(err.Error())
 		}
+		// 書き込み内容に CRLF が含まれているかを結果に明示
+		nl := describeNewline(strings.Contains(content, "\r\n"))
 		return CallToolResult{
-			Content: []ContentBlock{{Type: "text", Text: fmt.Sprintf("書き込み完了（%s）", path)}},
+			Content: []ContentBlock{{Type: "text", Text: fmt.Sprintf("新規作成完了（%s）: %d バイト書き込みました。改行コード: %s。", path, len(content), nl)}},
 		}, nil
 
 	case "edit_sjis":
@@ -672,7 +760,7 @@ func main() {
 			result = InitializeResult{
 				ProtocolVersion: "2024-11-05",
 				Capabilities:    Capabilities{Tools: &ToolsCapability{}},
-				ServerInfo:      ServerInfo{Name: "sjis-mcp", Version: "1.2.0"},
+				ServerInfo:      ServerInfo{Name: "sjis-mcp", Version: "1.3.0"},
 			}
 		case "notifications/initialized":
 			continue
