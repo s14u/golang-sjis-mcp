@@ -10,9 +10,10 @@ Claude Code の組み込み Read/Edit/Write ツールでは文字化けが発生
 
 | ツール | 説明 |
 |--------|------|
-| `read_sjis` | Shift JIS ファイルを読み込み、UTF-8 として返す（行範囲指定・検索対応、edit ヒント付き） |
+| `read_sjis` | Shift JIS ファイルを読み込み、UTF-8 として返す（行範囲指定・検索対応、`regex: true` で正規表現検索） |
 | `write_sjis` | UTF-8 文字列を Shift JIS で**新規ファイル**として書き込む（既存ファイルは拒否） |
 | `edit_sjis` | Shift JIS ファイル内の文字列を置換する（dry_run で diff 表示、CRLF/LF 自動保持） |
+| `detect_encoding` | ファイルのエンコーディングを判定（shift_jis / utf8 / utf8_bom / ascii / binary / unknown）。確信度と根拠も返す |
 
 ## ビルド
 
@@ -86,7 +87,25 @@ Shift JIS プロジェクトの `CLAUDE.md` に以下を追記することで、
 - 新規ファイルを作成する場合のみ `write_sjis` を使う（既存ファイルは拒否される）
 - grep/find/diff 等のシェルコマンドは Bash ツールで直接実行して構わない
   - ただし grep で日本語を検索する場合は `LANG=ja_JP.SJIS grep ...` のように指定する
+
+### SJIS / UTF-8 混在時のルール
+
+このプロジェクトは一部のディレクトリ（例: `docs/`）が UTF-8 です。
+迷ったら `detect_encoding` で判定してから:
+
+- `encoding: shift_jis` → `read_sjis` / `edit_sjis` / `write_sjis` を使う
+- `encoding: utf8` / `utf8_bom` / `ascii` → 組み込みの Read / Edit / Write を使う
+- `encoding: unknown` / `confidence: low` → ユーザーに確認する
 ```
+
+## v1.4.0 での改善点
+
+実利用フィードバックに基づく改善（フェーズB）：
+
+- **新ツール `detect_encoding` を追加** — SJIS / UTF-8 混在プロジェクトでファイル操作前にエンコーディングを判定。返り値は `encoding`（shift_jis / utf8 / utf8_bom / ascii / binary / unknown）、`confidence`（high / medium / low / unknown）、`reason`（判定根拠）、`alternatives`（代替候補）。判定優先順位は BOM → ASCII-only → UTF-8/SJIS 妥当性検査 → バイト統計の順
+- **`read_sjis` に正規表現検索モードを追加** — `regex: true` で `search` を Go の RE2 正規表現として解釈。`(?i)` で大文字小文字無視、`|` で OR、`^` / `$` で行頭・行末アンカー。既存の完全一致モードは互換性維持
+
+混在プロジェクトでの推奨ワークフロー: ファイル操作前に `detect_encoding` を呼び、結果に応じて `read_sjis` / `edit_sjis`（SJIS の場合）または組み込みの Read / Edit（UTF-8 の場合）を選択。
 
 ## v1.3.0 での改善点
 

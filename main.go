@@ -2,10 +2,13 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
+	"regexp"
 	"strings"
+	"unicode/utf8"
 
 	"golang.org/x/text/encoding/japanese"
 	"golang.org/x/text/transform"
@@ -93,7 +96,7 @@ type ContentBlock struct {
 var tools = []Tool{
 	{
 		Name:        "read_sjis",
-		Description: "Shift JIS エンコードのファイルを読み込み、UTF-8 文字列として返します。行番号付きで返すことも可能です。line_start/line_end で部分読み込みもできます。行番号付き / 部分読み込み / 検索の各モードでは、出力末尾に edit_sjis の行範囲モード使用例ヒントを付与します。",
+		Description: "Shift JIS エンコードのファイルを読み込み、UTF-8 文字列として返します。行番号付きで返すことも可能です。line_start/line_end で部分読み込み、search で grep 相当の検索（regex: true で正規表現モード）もできます。行番号付き / 部分読み込み / 検索の各モードでは、出力末尾に edit_sjis の行範囲モード使用例ヒントを付与します。",
 		InputSchema: InputSchema{
 			Type: "object",
 			Properties: map[string]Property{
@@ -115,7 +118,11 @@ var tools = []Tool{
 				},
 				"search": {
 					Type:        "string",
-					Description: "検索文字列（UTF-8）。指定するとマッチした行とその前後 context_lines 行のみ返す（grep 相当）",
+					Description: "検索文字列（UTF-8）。指定するとマッチした行とその前後 context_lines 行のみ返す（grep 相当）。デフォルトは部分一致・大文字小文字無視・NFC正規化",
+				},
+				"regex": {
+					Type:        "boolean",
+					Description: "true にすると search を Go の正規表現として解釈（RE2 構文）。大文字小文字無視は (?i) を、OR は | を使う。例: \"(?i)foo|bar\" / \"^void\\\\s+\\\\w+\\\\(\"",
 				},
 				"context_lines": {
 					Type:        "string",
@@ -205,6 +212,37 @@ var tools = []Tool{
 				},
 			},
 			Required: []string{"path", "new_str"},
+		},
+	},
+	{
+		Name: "detect_encoding",
+		Description: `指定ファイルの文字エンコーディングを判定します。確信度（high/medium/low/unknown）と判定根拠も返します。
+
+判定優先順位:
+1. BOM チェック（UTF-8 BOM など決定的シグナル）
+2. 空ファイル → unknown
+3. バイナリヒューリスティック（NUL 等の制御文字が多い） → binary
+4. ASCII のみ → ascii（SJIS / UTF-8 どちらでも安全に読める）
+5. UTF-8 のみ妥当 → utf8 (high)
+6. SJIS のみ妥当 → shift_jis (high)
+7. 両方妥当 → バイト統計で推測 (medium / low)
+8. 両方不正 → unknown
+
+確信度 unknown / low の場合は、ファイル拡張子・パス・周辺ファイルの状況も加味してユーザーに確認することを推奨します。
+SJIS/UTF-8 混在プロジェクト（例: thi120/ は SJIS、thi120/docs/ は UTF-8）でファイル操作前に呼び出すと安全です。`,
+		InputSchema: InputSchema{
+			Type: "object",
+			Properties: map[string]Property{
+				"path": {
+					Type:        "string",
+					Description: "判定対象ファイルのパス",
+				},
+				"sample_bytes": {
+					Type:        "string",
+					Description: "判定に使う先頭バイト数（デフォルト 65536）。巨大ファイルでも先頭サンプルだけで判定可能",
+				},
+			},
+			Required: []string{"path"},
 		},
 	},
 }
@@ -335,17 +373,182 @@ func describeNewline(hasCRLF bool) string {
 	return "LF"
 }
 
+// ─── エンコーディング検出 ────────────────────────────────────────────────────
+
+type EncodingResult struct {
+	Encoding     string   // shift_jis / utf8 / utf8_bom / ascii / unknown / binary
+	Confidence   string   // high / medium / low / unknown
+	Reason       string   // 判定根拠
+	Alternatives []string // 候補となる他のエンコーディング
+}
+
+// detectEncoding はバイト列のエンコーディングを判定する。
+// 判定は優先順位順に行い、決定的シグナル（BOM）から順にヒューリスティックへ降りる。
+func detectEncoding(data []byte) EncodingResult {
+	if len(data) == 0 {
+		return EncodingResult{
+			Encoding: "unknown", Confidence: "unknown",
+			Reason: "ファイルが空のため判定できません",
+		}
+	}
+
+	// 1. BOM 判定（決定的）
+	switch {
+	case bytes.HasPrefix(data, []byte{0xEF, 0xBB, 0xBF}):
+		return EncodingResult{
+			Encoding: "utf8_bom", Confidence: "high",
+			Reason: "先頭に UTF-8 BOM (EF BB BF) を検出",
+		}
+	case bytes.HasPrefix(data, []byte{0xFF, 0xFE}):
+		return EncodingResult{
+			Encoding: "binary", Confidence: "high",
+			Reason: "先頭に UTF-16 LE BOM (FF FE) を検出。本ツールは UTF-16 をサポートしません",
+		}
+	case bytes.HasPrefix(data, []byte{0xFE, 0xFF}):
+		return EncodingResult{
+			Encoding: "binary", Confidence: "high",
+			Reason: "先頭に UTF-16 BE BOM (FE FF) を検出。本ツールは UTF-16 をサポートしません",
+		}
+	}
+
+	// 2. バイナリヒューリスティック（NUL バイト・大量の制御文字）
+	nulCount := bytes.Count(data, []byte{0x00})
+	if nulCount > 0 {
+		return EncodingResult{
+			Encoding: "binary", Confidence: "high",
+			Reason: fmt.Sprintf("NUL バイトを %d 個検出（テキストファイルでは通常出現しない）", nulCount),
+		}
+	}
+
+	// 3. ASCII-only 判定
+	allASCII := true
+	for _, b := range data {
+		if b >= 0x80 {
+			allASCII = false
+			break
+		}
+	}
+	if allASCII {
+		return EncodingResult{
+			Encoding: "ascii", Confidence: "high",
+			Reason:       "全バイトが ASCII 範囲 (0x00-0x7F)。SJIS / UTF-8 どちらとしても安全に読めます",
+			Alternatives: []string{"utf8", "shift_jis"},
+		}
+	}
+
+	// 4. UTF-8 / SJIS の妥当性チェック
+	utf8Valid := utf8.Valid(data)
+
+	sjisDecoded, _, sjisErr := transform.Bytes(japanese.ShiftJIS.NewDecoder(), data)
+	sjisValid := sjisErr == nil
+	// SJIS decode 成功でも U+FFFD（置換文字）が混入していたら品質を疑う
+	sjisReplacementCount := strings.Count(string(sjisDecoded), "�")
+
+	// マルチバイト出現数の統計（両方妥当な場合の決め手）
+	utf8MultibyteRunes := 0
+	if utf8Valid {
+		for _, r := range string(data) {
+			if r > 127 {
+				utf8MultibyteRunes++
+			}
+		}
+	}
+	sjisLeadByteCount := 0
+	for _, b := range data {
+		// SJIS の漢字第1バイト範囲: 0x81-0x9F, 0xE0-0xFC
+		if (b >= 0x81 && b <= 0x9F) || (b >= 0xE0 && b <= 0xFC) {
+			sjisLeadByteCount++
+		}
+	}
+
+	switch {
+	case utf8Valid && !sjisValid:
+		return EncodingResult{
+			Encoding: "utf8", Confidence: "high",
+			Reason: fmt.Sprintf("UTF-8 として妥当（マルチバイト文字 %d 個）。SJIS としては復号エラー", utf8MultibyteRunes),
+		}
+	case !utf8Valid && sjisValid && sjisReplacementCount == 0:
+		return EncodingResult{
+			Encoding: "shift_jis", Confidence: "high",
+			Reason: fmt.Sprintf("SJIS として妥当（先頭バイト候補 %d 個）。UTF-8 としては不正バイト列を含む", sjisLeadByteCount),
+		}
+	case !utf8Valid && sjisValid && sjisReplacementCount > 0:
+		return EncodingResult{
+			Encoding: "shift_jis", Confidence: "medium",
+			Reason: fmt.Sprintf("SJIS として復号は成功したが置換文字 (U+FFFD) が %d 個混入。UTF-8 としては不正", sjisReplacementCount),
+		}
+	case utf8Valid && sjisValid:
+		// 両方妥当 → バイト統計で推測
+		if sjisReplacementCount > 0 {
+			return EncodingResult{
+				Encoding: "utf8", Confidence: "medium",
+				Reason:       fmt.Sprintf("UTF-8 として妥当。SJIS としても復号できるが置換文字 %d 個混入", sjisReplacementCount),
+				Alternatives: []string{"shift_jis"},
+			}
+		}
+		// SJIS 漢字先頭バイト数 vs UTF-8 マルチバイトルーン数
+		// UTF-8 の日本語1文字は通常3バイト（先頭1+継続2）なので、UTF-8 マルチバイトルーン数 ≒ SJIS 先頭バイト想定数になる
+		if sjisLeadByteCount > 0 && utf8MultibyteRunes > 0 {
+			return EncodingResult{
+				Encoding: "utf8", Confidence: "low",
+				Reason: fmt.Sprintf("両方として妥当（UTF-8 マルチバイト %d ルーン / SJIS 候補先頭バイト %d 個）。短いファイルや日本語の少ないファイルでは判定困難",
+					utf8MultibyteRunes, sjisLeadByteCount),
+				Alternatives: []string{"shift_jis"},
+			}
+		}
+		return EncodingResult{
+			Encoding: "utf8", Confidence: "low",
+			Reason:       "両方として妥当だが特徴的なバイトが少なく判定困難",
+			Alternatives: []string{"shift_jis"},
+		}
+	default: // 両方不正
+		return EncodingResult{
+			Encoding: "unknown", Confidence: "unknown",
+			Reason:       "UTF-8 / SJIS いずれとしても不正なバイト列。バイナリファイルや他のエンコーディング (EUC-JP, ISO-2022-JP 等) の可能性",
+			Alternatives: []string{"binary", "euc_jp", "iso_2022_jp"},
+		}
+	}
+}
+
+// formatEncodingResult は EncodingResult を Claude が読みやすいテキストに整形する。
+func formatEncodingResult(path string, size int, sampleSize int, r EncodingResult) string {
+	sb := strings.Builder{}
+	fmt.Fprintf(&sb, "encoding: %s\n", r.Encoding)
+	fmt.Fprintf(&sb, "confidence: %s\n", r.Confidence)
+	fmt.Fprintf(&sb, "reason: %s\n", r.Reason)
+	if len(r.Alternatives) > 0 {
+		fmt.Fprintf(&sb, "alternatives: %s\n", strings.Join(r.Alternatives, ", "))
+	} else {
+		sb.WriteString("alternatives: (なし)\n")
+	}
+	fmt.Fprintf(&sb, "file: %s (%d バイト, 判定に使用 %d バイト)\n", path, size, sampleSize)
+
+	// アクション提案
+	switch r.Encoding {
+	case "utf8", "utf8_bom", "ascii":
+		sb.WriteString("\n推奨ツール: 組み込みの Read / Edit / Write （sjis-mcp は不要）")
+	case "shift_jis":
+		sb.WriteString("\n推奨ツール: read_sjis / edit_sjis / write_sjis")
+	case "binary":
+		sb.WriteString("\n推奨ツール: テキストツールは使用不可。バイナリ専用ツールで扱ってください")
+	case "unknown":
+		sb.WriteString("\n推奨アクション: ユーザーに確認するか、ファイル拡張子・周辺ファイル・プロジェクト規約から判断してください")
+	}
+	return sb.String()
+}
+
 // ─── 検索: grep 相当 ─────────────────────────────────────────────────────────
 
-func searchInContent(content, query string, contextLines int) string {
+// searchInContentBy は match 関数で各行を判定し、マッチ行 ± contextLines を整形して返す。
+// match の引数は NFC 正規化済み・元のケース（小文字化はしない）の行文字列。
+// マッチが無ければ空文字列を返す。
+func searchInContentBy(content string, contextLines int, match func(normalizedLine string) bool) string {
 	normalizedContent := strings.ReplaceAll(content, "\r\n", "\n")
 	lines := strings.Split(normalizedContent, "\n")
 
-	// マッチ行を収集（NFC 正規化 + 大文字小文字無視）
 	matchedLines := map[int]bool{}
-	queryLower := strings.ToLower(normalizeUnicode(query))
 	for i, line := range lines {
-		if strings.Contains(strings.ToLower(normalizeUnicode(line)), queryLower) {
+		if match(normalizeUnicode(line)) {
 			matchedLines[i] = true
 		}
 	}
@@ -382,6 +585,27 @@ func searchInContent(content, query string, contextLines int) string {
 		prevLine = i
 	}
 	return sb.String()
+}
+
+// searchInContent は完全一致モード（既存挙動）。NFC 正規化 + 大文字小文字無視。
+func searchInContent(content, query string, contextLines int) string {
+	queryLower := strings.ToLower(normalizeUnicode(query))
+	return searchInContentBy(content, contextLines, func(normalizedLine string) bool {
+		return strings.Contains(strings.ToLower(normalizedLine), queryLower)
+	})
+}
+
+// searchInContentRegex は正規表現モード。
+// 大文字小文字無視は (?i) フラグをパターン側で指定する。
+// パターンは NFC 正規化されないので、リテラル日本語を含む場合はユーザー側で正規化済みであること前提。
+func searchInContentRegex(content, pattern string, contextLines int) (string, error) {
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		return "", fmt.Errorf("正規表現のコンパイルに失敗しました: %w", err)
+	}
+	return searchInContentBy(content, contextLines, func(normalizedLine string) bool {
+		return re.MatchString(normalizedLine)
+	}), nil
 }
 
 // ─── edit_sjis 実装 ───────────────────────────────────────────────────────────
@@ -600,9 +824,23 @@ func handleCallTool(params json.RawMessage) (interface{}, *RPCError) {
 			if contextLines <= 0 {
 				contextLines = 3
 			}
-			result := searchInContent(content, searchStr, contextLines)
+			useRegex := getBool("regex", false)
+			var result string
+			if useRegex {
+				r, err := searchInContentRegex(content, searchStr, contextLines)
+				if err != nil {
+					return errResult(err.Error())
+				}
+				result = r
+			} else {
+				result = searchInContent(content, searchStr, contextLines)
+			}
 			if result == "" {
-				return errResult(fmt.Sprintf("検索文字列 %q が見つかりませんでした（%s）", searchStr, path))
+				modeNote := ""
+				if useRegex {
+					modeNote = "（正規表現モード）"
+				}
+				return errResult(fmt.Sprintf("検索パターン %q が見つかりませんでした%s（%s）", searchStr, modeNote, path))
 			}
 			result += fmt.Sprintf("\nヒント: 上記マッチ行 ('>' 印) の行番号を控えて edit_sjis を {path: %q, line_start: <N>, line_end: <M>, new_str: \"...\"} で呼ぶと該当範囲を直接編集できます。\n", path)
 			return CallToolResult{
@@ -724,6 +962,40 @@ func handleCallTool(params json.RawMessage) (interface{}, *RPCError) {
 		}
 		return CallToolResult{Content: []ContentBlock{{Type: "text", Text: msg}}}, nil
 
+	case "detect_encoding":
+		path, ok := getString("path")
+		if !ok {
+			return errResult("path が指定されていません")
+		}
+		sampleSize := 65536
+		if n, ok := getInt("sample_bytes"); ok && n > 0 {
+			sampleSize = n
+		}
+
+		f, err := os.Open(path)
+		if err != nil {
+			return errResult(fmt.Sprintf("ファイルを開けませんでした: %v", err))
+		}
+		defer f.Close()
+		info, err := f.Stat()
+		if err != nil {
+			return errResult(fmt.Sprintf("ファイル情報の取得に失敗しました: %v", err))
+		}
+		readSize := sampleSize
+		if int64(readSize) > info.Size() {
+			readSize = int(info.Size())
+		}
+		buf := make([]byte, readSize)
+		n, err := f.Read(buf)
+		if err != nil && n == 0 {
+			return errResult(fmt.Sprintf("ファイルの読み込みに失敗しました: %v", err))
+		}
+		buf = buf[:n]
+		result := detectEncoding(buf)
+		return CallToolResult{
+			Content: []ContentBlock{{Type: "text", Text: formatEncodingResult(path, int(info.Size()), n, result)}},
+		}, nil
+
 	default:
 		return errResult(fmt.Sprintf("不明なツール: %s", p.Name))
 	}
@@ -760,7 +1032,7 @@ func main() {
 			result = InitializeResult{
 				ProtocolVersion: "2024-11-05",
 				Capabilities:    Capabilities{Tools: &ToolsCapability{}},
-				ServerInfo:      ServerInfo{Name: "sjis-mcp", Version: "1.3.0"},
+				ServerInfo:      ServerInfo{Name: "sjis-mcp", Version: "1.4.0"},
 			}
 		case "notifications/initialized":
 			continue
